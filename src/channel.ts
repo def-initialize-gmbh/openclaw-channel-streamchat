@@ -1,0 +1,578 @@
+import { randomUUID } from "node:crypto";
+import type { Event } from "stream-chat";
+import type {
+  ChannelGatewayContext,
+  ChannelLogSink,
+  ChannelOutboundContext,
+  OpenClawConfig,
+} from "openclaw/plugin-sdk";
+import { buildChannelConfigSchema } from "openclaw/plugin-sdk";
+import { StreamChatConfigSchema } from "./config-schema.js";
+import { getStreamChatRuntime } from "./runtime.js";
+import { StreamChatClientRuntime } from "./stream-chat-runtime.js";
+import { StreamingHandler } from "./streaming.js";
+import { RunContextMap } from "./run-context.js";
+import { buildEnvelope } from "./envelope.js";
+import { safeAsync } from "./utils.js";
+import type {
+  ResolvedAccount,
+  StreamChatChannelPlugin,
+  RunContext,
+} from "./types.js";
+import {
+  listStreamChatAccountIds,
+  resolveStreamChatAccount,
+} from "./types.js";
+
+// Track which threads we've already seen (for first-in-thread detection)
+const seenThreads = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// Reactions helper
+// ---------------------------------------------------------------------------
+
+async function addReaction(
+  runtime: StreamChatClientRuntime,
+  channelType: string,
+  channelId: string,
+  messageId: string,
+  reactionType: string,
+  log?: ChannelLogSink,
+): Promise<void> {
+  try {
+    const channel = await runtime.getOrQueryChannel(channelType, channelId);
+    await channel.sendReaction(messageId, { type: reactionType });
+  } catch (err) {
+    log?.warn?.(
+      `[StreamChat] Failed to add reaction ${reactionType}: ${String(err)}`,
+    );
+  }
+}
+
+async function removeReaction(
+  runtime: StreamChatClientRuntime,
+  channelType: string,
+  channelId: string,
+  messageId: string,
+  reactionType: string,
+  log?: ChannelLogSink,
+): Promise<void> {
+  try {
+    const channel = await runtime.getOrQueryChannel(channelType, channelId);
+    await channel.deleteReaction(messageId, reactionType);
+  } catch (err) {
+    log?.warn?.(
+      `[StreamChat] Failed to remove reaction ${reactionType}: ${String(err)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound message handler
+// ---------------------------------------------------------------------------
+
+interface HandleMessageParams {
+  cfg: OpenClawConfig;
+  accountId: string;
+  account: ResolvedAccount;
+  event: Event;
+  chatRuntime: StreamChatClientRuntime;
+  streamingHandler: StreamingHandler;
+  runContexts: RunContextMap;
+  log?: ChannelLogSink;
+}
+
+async function handleStreamChatMessage(params: HandleMessageParams): Promise<void> {
+  const {
+    cfg,
+    accountId,
+    account,
+    event,
+    chatRuntime,
+    streamingHandler,
+    runContexts,
+    log,
+  } = params;
+  const rt = getStreamChatRuntime();
+
+  const message = event.message;
+  if (!message) return;
+
+  // Bot echo prevention: skip our own messages and AI-generated messages
+  if (event.user?.id === account.botUserId) return;
+  if (message.ai_generated) return;
+
+  const text = message.text?.trim();
+  if (!text) return;
+
+  const channelType = event.channel_type ?? "messaging";
+  const channelId = event.channel_id ?? "";
+  const messageId = message.id;
+  const senderId = event.user?.id ?? "unknown";
+  const senderName = event.user?.name || senderId;
+
+  // Determine thread and reply context
+  const threadParentId = message.parent_id ?? null;
+  const quotedMessageId = message.quoted_message_id ?? null;
+  const quotedMessage = message.quoted_message ?? null;
+
+  // Resolve agent route
+  // Use peer kind "channel" so the framework builds per-channel session keys:
+  //   agent:<agentId>:streamchat:channel:<channelId>
+  // This ensures each Stream Chat channel gets its own session (per action plan).
+  const route = rt.channel.routing.resolveAgentRoute({
+    cfg,
+    channel: "streamchat",
+    accountId,
+    peer: { kind: "channel", id: channelId },
+  });
+
+  const storePath = rt.channel.session.resolveStorePath(
+    cfg.session?.store,
+    { agentId: route.agentId },
+  );
+
+  // Build envelope with thread/reply context
+  let threadParentInfo: {
+    id: string;
+    text?: string;
+    userId?: string;
+    userName?: string;
+  } | null = null;
+
+  if (threadParentId) {
+    // Try to get the parent message for context
+    try {
+      const channel = await chatRuntime.getOrQueryChannel(channelType, channelId);
+      await channel.getReplies(threadParentId, { limit: 0 });
+      // The parent message is embedded in the channel messages
+      const state = channel.state;
+      const parentMsg = state.messages.find((m) => m.id === threadParentId);
+      threadParentInfo = {
+        id: threadParentId,
+        text: parentMsg?.text ?? undefined,
+        userId: parentMsg?.user?.id ?? undefined,
+        userName: parentMsg?.user?.name ?? undefined,
+      };
+    } catch {
+      threadParentInfo = { id: threadParentId };
+    }
+  }
+
+  let quotedInfo: {
+    id: string;
+    text?: string;
+    userId?: string;
+    userName?: string;
+  } | null = null;
+
+  if (quotedMessageId || quotedMessage) {
+    quotedInfo = {
+      id: quotedMessageId ?? quotedMessage?.id ?? "",
+      text: quotedMessage?.text ?? undefined,
+      userId: quotedMessage?.user?.id ?? undefined,
+      userName: quotedMessage?.user?.name ?? undefined,
+    };
+  }
+
+  const isFirstInThread = threadParentId
+    ? !seenThreads.has(threadParentId)
+    : false;
+  if (threadParentId) seenThreads.add(threadParentId);
+
+  const envelope = buildEnvelope({
+    text,
+    senderId,
+    senderName,
+    messageId,
+    quotedMessage: quotedInfo,
+    threadParent: threadParentInfo,
+    isFirstInThread,
+  });
+
+  // Finalize inbound context
+  const to = channelId;
+  const fromLabel = `${senderName} (${senderId})`;
+
+  const ctx = rt.channel.reply.finalizeInboundContext({
+    Body: envelope.body,
+    RawBody: text,
+    CommandBody: envelope.commandBody,
+    From: to,
+    To: to,
+    SessionKey: route.sessionKey,
+    AccountId: accountId,
+    ChatType: "channel" as const,
+    ConversationLabel: fromLabel,
+    SenderName: senderName,
+    SenderId: senderId,
+    Provider: "streamchat",
+    Surface: "streamchat",
+    MessageSid: messageId,
+    Timestamp: message.created_at
+      ? new Date(message.created_at).getTime()
+      : Date.now(),
+    OriginatingChannel: "streamchat",
+    OriginatingTo: to,
+  });
+
+  // Record session
+  await rt.channel.session.recordInboundSession({
+    storePath,
+    sessionKey: ctx.SessionKey || route.sessionKey,
+    ctx,
+    updateLastRoute: {
+      sessionKey: route.mainSessionKey,
+      channel: "streamchat",
+      to,
+      accountId,
+    },
+    onRecordError: (err: unknown) => {
+      log?.error?.(
+        `[StreamChat] Failed to record inbound session: ${String(err)}`,
+      );
+    },
+  });
+
+  log?.info?.(
+    `[StreamChat] Inbound: from=${senderName} text="${text.slice(0, 50)}"`,
+  );
+
+  // Send ack reaction
+  if (account.ackReaction) {
+    safeAsync(
+      () =>
+        addReaction(
+          chatRuntime,
+          channelType,
+          channelId,
+          messageId,
+          account.ackReaction,
+          log,
+        ),
+      log,
+      "ack reaction",
+    );
+  }
+
+  // Create RunContext for delivery routing
+  const runId = randomUUID();
+  const runCtx: RunContext = {
+    runId,
+    channelType,
+    channelId,
+    threadParentId,
+    inboundMessageId: messageId,
+    senderId,
+    responseMessageId: null,
+  };
+  runContexts.set(runId, runCtx);
+
+  // Track whether streaming has started and whether an error was delivered
+  let streamStarted = false;
+  let errorDelivered = false;
+
+  // Dispatch reply via the buffered block dispatcher
+  // The deliver callback receives (payload, info) where info.kind is "tool" | "block" | "final".
+  // Completion is signaled when dispatchReplyWithBufferedBlockDispatcher returns, not via a payload flag.
+  await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx,
+    cfg,
+    dispatcherOptions: {
+      responsePrefix: "",
+      deliver: async (
+        payload: { text?: string; isError?: boolean },
+        info: { kind: string },
+      ) => {
+        try {
+          const channel = await chatRuntime.getOrQueryChannel(
+            channelType,
+            channelId,
+          );
+
+          // Handle tool progress events
+          if (info.kind === "tool") {
+            if (streamStarted) {
+              await streamingHandler.onRunProgress(runId);
+            }
+            return;
+          }
+
+          const textToSend = payload.text;
+
+          // Handle error
+          if (payload.isError) {
+            if (streamStarted) {
+              await streamingHandler.onRunError(
+                runId,
+                textToSend || "Unknown error",
+              );
+              errorDelivered = true;
+            }
+            return;
+          }
+
+          if (!textToSend) return;
+
+          // Start streaming on first text chunk
+          if (!streamStarted) {
+            await streamingHandler.onRunStarted(runId, channel, runCtx);
+            streamStarted = true;
+          }
+
+          // Stream text chunk
+          await streamingHandler.onTextChunk(
+            runId,
+            textToSend,
+            account.streamingThrottle,
+          );
+        } catch (err) {
+          log?.error?.(
+            `[StreamChat] Deliver failed: ${String(err)}`,
+          );
+          throw err;
+        }
+      },
+    },
+  });
+
+  // Finalize after all deliveries complete
+  if (streamStarted && !errorDelivered) {
+    await streamingHandler.onRunCompleted(runId);
+  }
+
+  // Swap ack → done reaction
+  if (account.ackReaction && account.doneReaction) {
+    safeAsync(
+      async () => {
+        await removeReaction(
+          chatRuntime,
+          channelType,
+          channelId,
+          messageId,
+          account.ackReaction,
+          log,
+        );
+        await addReaction(
+          chatRuntime,
+          channelType,
+          channelId,
+          messageId,
+          account.doneReaction,
+          log,
+        );
+      },
+      log,
+      "reaction swap",
+    );
+  }
+
+  runContexts.delete(runId);
+}
+
+// ---------------------------------------------------------------------------
+// Channel plugin definition
+// ---------------------------------------------------------------------------
+
+export const streamchatPlugin: StreamChatChannelPlugin = {
+  id: "streamchat",
+
+  meta: {
+    id: "streamchat",
+    label: "Stream Chat",
+    selectionLabel: "Stream Chat",
+    docsPath: "/channels/streamchat",
+    blurb: "Stream Chat messaging channel with AI streaming support.",
+    aliases: ["sc"],
+  },
+
+  capabilities: {
+    chatTypes: ["channel"],
+    reactions: true,
+    threads: true,
+    media: false,
+    nativeCommands: false,
+    blockStreaming: false,
+  },
+
+  reload: { configPrefixes: ["channels.streamchat"] },
+
+  configSchema: buildChannelConfigSchema(StreamChatConfigSchema),
+
+  config: {
+    listAccountIds: (cfg: OpenClawConfig): string[] =>
+      listStreamChatAccountIds(cfg),
+
+    resolveAccount: (
+      cfg: OpenClawConfig,
+      accountId?: string | null,
+    ): ResolvedAccount => resolveStreamChatAccount(cfg, accountId),
+
+    defaultAccountId: () => "default",
+
+    isConfigured: (account: ResolvedAccount): boolean =>
+      Boolean(account.apiKey && account.botUserId && account.botUserToken),
+
+    describeAccount: (account: ResolvedAccount) => ({
+      accountId: account.accountId,
+      name: account.botUserName || account.botUserId || undefined,
+      enabled: account.enabled,
+      configured: account.configured,
+      running: false,
+      lastStartAt: null,
+      lastStopAt: null,
+      lastError: null,
+    }),
+  },
+
+  outbound: {
+    deliveryMode: "direct",
+
+    sendText: async (ctx: ChannelOutboundContext) => {
+      const account = resolveStreamChatAccount(ctx.cfg, ctx.accountId);
+      if (!account.configured) {
+        throw new Error("StreamChat account not configured");
+      }
+
+      // We need to create a temporary client to send the outbound message.
+      // In gateway mode, we reuse the running runtime, but for outbound-only
+      // we create an ephemeral connection.
+      const tempRuntime = new StreamChatClientRuntime(account);
+      try {
+        await tempRuntime.start();
+        const channel = await tempRuntime.getOrQueryChannel(
+          "messaging",
+          ctx.to,
+        );
+
+        const msgPayload: Record<string, unknown> = { text: ctx.text };
+        if (ctx.threadId) {
+          msgPayload.parent_id = String(ctx.threadId);
+        }
+
+        const { message } = await channel.sendMessage(
+          msgPayload as Parameters<typeof channel.sendMessage>[0],
+        );
+
+        return {
+          channel: "streamchat" as const,
+          messageId: message.id,
+        };
+      } finally {
+        await tempRuntime.stop();
+      }
+    },
+  },
+
+  gateway: {
+    startAccount: async (
+      ctx: ChannelGatewayContext<ResolvedAccount>,
+    ): Promise<{ stop: () => void }> => {
+      const { cfg, accountId, account, log, abortSignal } = ctx;
+
+      if (!account.configured) {
+        throw new Error(
+          "StreamChat not configured: apiKey, botUserId, and botUserToken are required",
+        );
+      }
+
+      const chatRuntime = new StreamChatClientRuntime(account, log);
+      const runContexts = new RunContextMap();
+      const streamingHandler = new StreamingHandler({
+        client: chatRuntime.getClient(),
+        runContexts,
+        log,
+      });
+
+      // Connect and watch channels
+      await chatRuntime.start();
+
+      ctx.setStatus({
+        ...ctx.getStatus(),
+        running: true,
+        lastStartAt: Date.now(),
+        lastError: null,
+      });
+
+      // Listen for new messages
+      const client = chatRuntime.getClient();
+      const handleMessage = (event: Event) => {
+        handleStreamChatMessage({
+          cfg,
+          accountId,
+          account,
+          event,
+          chatRuntime,
+          streamingHandler,
+          runContexts,
+          log,
+        }).catch((err) => {
+          log?.error?.(
+            `[StreamChat] Message handler error: ${String(err)}`,
+          );
+        });
+      };
+
+      client.on("message.new", handleMessage);
+
+      // Listen for force stop from client
+      client.on("ai_indicator.stop" as "user.watching.start", (event: Event) => {
+        // Find the run associated with this message
+        const messageId = (event as unknown as Record<string, unknown>).message_id as string | undefined;
+        if (!messageId) return;
+
+        // Look through active streams to find the matching run
+        const activeRun = runContexts.findByResponseMessageId(messageId);
+        if (activeRun) {
+          streamingHandler.onForceStop(activeRun.runId).catch((err) => {
+            log?.warn?.(
+              `[StreamChat] Force stop error: ${String(err)}`,
+            );
+          });
+        }
+      });
+
+      // Handle abort signal
+      const handleAbort = () => {
+        client.off("message.new", handleMessage);
+        chatRuntime.stop().catch((err) => {
+          log?.error?.(
+            `[StreamChat] Disconnect error: ${String(err)}`,
+          );
+        });
+        ctx.setStatus({
+          ...ctx.getStatus(),
+          running: false,
+          lastStopAt: Date.now(),
+        });
+      };
+
+      if (abortSignal) {
+        abortSignal.addEventListener("abort", handleAbort, { once: true });
+      }
+
+      log?.info?.(
+        `[StreamChat] Gateway started for account "${accountId}"`,
+      );
+
+      return {
+        stop: () => {
+          handleAbort();
+        },
+      };
+    },
+  },
+
+  status: {
+    defaultRuntime: {
+      accountId: "default",
+      name: undefined,
+      enabled: true,
+      configured: false,
+      running: false,
+      lastStartAt: null,
+      lastStopAt: null,
+      lastError: null,
+    },
+  },
+};

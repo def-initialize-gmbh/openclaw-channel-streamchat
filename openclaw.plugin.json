@@ -1,0 +1,9 @@
+{
+  "id": "streamchat",
+  "channels": ["streamchat"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}
