@@ -11,7 +11,7 @@ npm run type-check          # tsc --noEmit
 # Run individual test scripts (no build step needed — tsx runs TS directly)
 npx tsx scripts/generate-bot-token.ts
 npx tsx scripts/discover-channels.ts
-npx tsx scripts/test-client.ts
+npx tsx scripts/chat-client.ts
 npx tsx scripts/test-roundtrip.ts
 npx tsx scripts/test-thread.ts
 

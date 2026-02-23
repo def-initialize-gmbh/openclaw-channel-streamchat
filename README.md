@@ -99,19 +99,19 @@ Override the defaults with environment variables:
 STREAM_API_KEY=... USER_ID=myuser USER_TOKEN=... npx tsx scripts/discover-channels.ts
 ```
 
-### Interactive test client
+### Interactive chat client
 
 Connects as a test user, watches a channel, and lets you send messages interactively while printing incoming bot responses and AI indicator events:
 
 ```bash
 # Auto-discover channels and use the first one
-npx tsx scripts/test-client.ts
+npx tsx scripts/chat-client.ts
 
 # Specify a channel
-npx tsx scripts/test-client.ts myChannelId
+npx tsx scripts/chat-client.ts myChannelId
 
 # Send a single message
-npx tsx scripts/test-client.ts myChannelId "Hello bot"
+npx tsx scripts/chat-client.ts myChannelId "Hello bot"
 ```
 
 Commands inside the interactive client:
@@ -125,7 +125,7 @@ Commands inside the interactive client:
 Override the test user with environment variables:
 
 ```bash
-STREAM_API_KEY=... TEST_USER_ID=myuser TEST_USER_TOKEN=... npx tsx scripts/test-client.ts
+STREAM_API_KEY=... TEST_USER_ID=myuser TEST_USER_TOKEN=... npx tsx scripts/chat-client.ts
 ```
 
 ### Automated round-trip test
