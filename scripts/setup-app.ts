@@ -15,7 +15,8 @@
  * STREAM_API_KEY can be in .env or passed on the command line.
  */
 
-import "dotenv/config";
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -96,8 +97,8 @@ config.channels = channels;
 writeFileSync(OPENCLAW_CONFIG, JSON.stringify(config, null, 2) + "\n");
 console.log(`  ✓ channels.streamchat updated`);
 
-// Step 6: Write .env at project root for all scripts
-const envPath = join(PROJECT_ROOT, ".env");
+// Step 6: Write .env in scripts/ for all scripts
+const envPath = join(SCRIPTS_DIR, ".env");
 const envContent = [
   `STREAM_API_KEY=${API_KEY}`,
   `TEST_USER_ID=${TEST_USER_ID}`,

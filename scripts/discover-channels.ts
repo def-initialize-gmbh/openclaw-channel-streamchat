@@ -8,7 +8,8 @@
  * Requires a .env file at the project root (see .env.example).
  */
 
-import "dotenv/config";
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
 
 const apiKey = process.env.STREAM_API_KEY;

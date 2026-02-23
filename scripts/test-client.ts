@@ -14,7 +14,8 @@
  *   npx tsx scripts/test-client.ts myChannel "Hello"  # Send a message and watch
  */
 
-import "dotenv/config";
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
 import { createInterface } from "node:readline";
 

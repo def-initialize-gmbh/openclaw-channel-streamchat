@@ -12,7 +12,8 @@
  *   channels.streamchat.botUserToken
  */
 
-import "dotenv/config";
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
 
 const apiKey = process.env.STREAM_API_KEY;
