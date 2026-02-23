@@ -6,3 +6,4 @@ dist/
 *.d.ts.map
 !scripts/*.ts
 .env
+!.env.example

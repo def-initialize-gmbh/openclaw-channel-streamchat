@@ -268,16 +268,35 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
   };
   runContexts.set(runId, runCtx);
 
-  // Track whether streaming has started and whether an error was delivered
-  let streamStarted = false;
+  // Pre-create the placeholder message before dispatch so the message ID is
+  // available when onPartialReply fires (which is called fire-and-forget by
+  // OpenClaw and cannot safely do async work itself).
+  const responseChannel = await chatRuntime.getOrQueryChannel(channelType, channelId);
+  await streamingHandler.onRunStarted(runId, responseChannel, runCtx);
+
   let errorDelivered = false;
 
-  // Dispatch reply via the buffered block dispatcher
-  // The deliver callback receives (payload, info) where info.kind is "tool" | "block" | "final".
-  // Completion is signaled when dispatchReplyWithBufferedBlockDispatcher returns, not via a payload flag.
+  // Track cumulative text from onPartialReply to compute per-token deltas.
+  // onPartialReply gives full accumulated text so far ("2", "2 +", "2 + 2 = 4"),
+  // while onTextChunk expects a delta and appends it. We slice to get the new portion.
+  let lastPartialText = "";
+
+  // Dispatch reply via the buffered block dispatcher.
+  // onPartialReply fires for every streaming token (preview streaming).
+  // deliver is called once per complete block; used here only for tool/error events.
   await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx,
     cfg,
+    replyOptions: {
+      onPartialReply: (payload: { text?: string }) => {
+        const full = payload.text ?? "";
+        const delta = full.slice(lastPartialText.length);
+        lastPartialText = full;
+        if (delta) {
+          void streamingHandler.onTextChunk(runId, delta, account.streamingThrottle);
+        }
+      },
+    },
     dispatcherOptions: {
       responsePrefix: "",
       deliver: async (
@@ -285,47 +304,23 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
         info: { kind: string },
       ) => {
         try {
-          const channel = await chatRuntime.getOrQueryChannel(
-            channelType,
-            channelId,
-          );
-
-          // Handle tool progress events
+          // Tool progress: update indicator to EXTERNAL_SOURCES
           if (info.kind === "tool") {
-            if (streamStarted) {
-              await streamingHandler.onRunProgress(runId);
-            }
+            await streamingHandler.onRunProgress(runId);
             return;
           }
 
-          const textToSend = payload.text;
-
-          // Handle error
+          // Error: finalize with error state
           if (payload.isError) {
-            if (streamStarted) {
-              await streamingHandler.onRunError(
-                runId,
-                textToSend || "Unknown error",
-              );
-              errorDelivered = true;
-            }
+            await streamingHandler.onRunError(
+              runId,
+              payload.text || "Unknown error",
+            );
+            errorDelivered = true;
             return;
           }
 
-          if (!textToSend) return;
-
-          // Start streaming on first text chunk
-          if (!streamStarted) {
-            await streamingHandler.onRunStarted(runId, channel, runCtx);
-            streamStarted = true;
-          }
-
-          // Stream text chunk
-          await streamingHandler.onTextChunk(
-            runId,
-            textToSend,
-            account.streamingThrottle,
-          );
+          // Text blocks are handled token-by-token via onPartialReply above.
         } catch (err) {
           log?.error?.(
             `[StreamChat] Deliver failed: ${String(err)}`,
@@ -337,7 +332,7 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
   });
 
   // Finalize after all deliveries complete
-  if (streamStarted && !errorDelivered) {
+  if (!errorDelivered) {
     await streamingHandler.onRunCompleted(runId);
   }
 

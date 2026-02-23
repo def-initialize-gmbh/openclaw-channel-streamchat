@@ -67,13 +67,19 @@ message.new (WebSocket)
       → buildEnvelope       (wraps text with thread/reply context tags)
       → finalizeInboundContext
       → recordInboundSession
+      → onRunStarted        (pre-creates placeholder + THINKING indicator)
       → dispatchReplyWithBufferedBlockDispatcher
-          deliver(payload, info) called per block:
+          replyOptions.onPartialReply fires per streaming token (cumulative text):
+            delta = full.slice(lastPartialText.length) → onTextChunk (throttled partialUpdateMessage)
+          deliver(payload, info) called once per complete block:
             info.kind === "tool"  → onRunProgress (EXTERNAL_SOURCES indicator)
-            text chunk            → onRunStarted (first) + onTextChunk
+            payload.isError       → onRunError (error text + ERROR indicator)
+            text block            → no-op (already handled token-by-token above)
           after dispatcher returns:
             → onRunCompleted (final partialUpdateMessage + ai_indicator.clear)
 ```
+
+**Why pre-create the placeholder:** `onPartialReply` is called fire-and-forget (`void`) by OpenClaw, so it cannot safely do async work (like `channel.sendMessage`). The placeholder must exist before the first token arrives.
 
 The `ai_generated: true` check is critical — without it the bot would trigger on its own empty placeholder message created by `onRunStarted`, causing an infinite loop.
 
@@ -84,11 +90,11 @@ How each signal from the OpenClaw pipeline translates into Stream Chat API calls
 | Trigger | Stream Chat action | Notes |
 |---|---|---|
 | Inbound message received | `channel.sendReaction(msgId, { type: "eyes" })` | Ack reaction, fire-and-forget |
-| First `deliver` text block | `channel.sendMessage({ text: "", ai_generated: true })` | Creates the bot's placeholder message |
-| First `deliver` text block | `channel.sendEvent({ type: "ai_indicator.update", ai_state: "AI_STATE_THINKING" })` | Immediately followed by GENERATING below |
-| First text chunk processed | `channel.sendEvent({ type: "ai_indicator.update", ai_state: "AI_STATE_GENERATING" })` | Transitions from THINKING on the very first `onTextChunk` call |
-| Text chunk — throttled flush | `client.partialUpdateMessage(msgId, { set: { text, generating: true } })` | Odd chunks 1,3,5,7; then every N (default 15). Chained via `lastUpdatePromise` to avoid out-of-order updates |
-| `deliver` with `info.kind === "tool"` | `channel.sendEvent({ type: "ai_indicator.update", ai_state: "AI_STATE_EXTERNAL_SOURCES" })` | Only emitted once per run (de-duplicated by `indicatorState`); only if streaming has already started |
+| Pre-dispatch (before agent runs) | `channel.sendMessage({ text: "", ai_generated: true })` | Creates the bot's placeholder message |
+| Pre-dispatch (before agent runs) | `channel.sendEvent({ type: "ai_indicator.update", ai_state: "AI_STATE_THINKING" })` | Sent immediately with placeholder |
+| `onPartialReply` first token | `channel.sendEvent({ type: "ai_indicator.update", ai_state: "AI_STATE_GENERATING" })` | Transitions from THINKING on the very first token |
+| `onPartialReply` per token — throttled | `client.partialUpdateMessage(msgId, { set: { text, generating: true } })` | Delta-computed from cumulative text. Odd chunks 1,3,5,7; then every N (default 15). Chained via `lastUpdatePromise` to avoid out-of-order updates |
+| `deliver` with `info.kind === "tool"` | `channel.sendEvent({ type: "ai_indicator.update", ai_state: "AI_STATE_EXTERNAL_SOURCES" })` | Only emitted once per run (de-duplicated by `indicatorState`) |
 | Dispatcher resolves (run complete) | `client.partialUpdateMessage(msgId, { set: { text, generating: false } })` | Final flush, waits for any in-flight partial updates first |
 | Dispatcher resolves (run complete) | `channel.sendEvent({ type: "ai_indicator.clear" })` | Clears the indicator bubble |
 | Dispatcher resolves (run complete) | `channel.deleteReaction(inboundMsgId, "eyes")` → `channel.sendReaction(inboundMsgId, { type: "white_check_mark" })` | Reaction swap on the original user message |
@@ -145,3 +151,4 @@ Config supports a flat default account or named sub-accounts:
 - **Partial updates are chained via `lastUpdatePromise`.** Each `partialUpdateMessage` is `.then()`-chained onto the previous one to avoid out-of-order message text.
 - **`safeSendEvent` swallows errors.** Indicator events are best-effort; a failed `ai_indicator` update must not abort message delivery. Retries: 5 attempts, exponential backoff starting at 100 ms, only on 429/5xx.
 - **`seenThreads` is process-scoped.** The `Set<string>` tracking "first message in thread" lives at module level, so it persists across gateway reloads until the process restarts. This is intentional — it avoids re-sending parent context for active threads after a config reload.
+- **`onTextChunk` receives deltas despite the wire protocol using full text.** `onPartialReply` provides cumulative text; `channel.ts` extracts the delta before calling `onTextChunk`. Inside `StreamingHandler`, `onTextChunk` re-accumulates deltas into `accumulatedText` and passes that full string to `partialUpdateMessage`. The round-trip is: cumulative → delta → cumulative. The delta extraction exists because `StreamingHandler` was designed around the "streaming chunks" mental model — it owns the accumulation and the throttle counter, making that API feel natural. The redundancy is intentional for architectural clarity, not a bug.
