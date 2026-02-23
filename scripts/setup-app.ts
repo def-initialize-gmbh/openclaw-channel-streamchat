@@ -6,8 +6,8 @@
  *   1. Creates/upserts a bot user and a test user via the server API
  *   2. Generates permanent tokens for both
  *   3. Creates a messaging channel with both as members
- *   4. Updates ~/.openclaw/openclaw.json with the new bot credentials
- *   5. Writes a .env file at the project root
+ *   4. Updates ~/.openclaw/openclaw.json with apiKey, botUserId, botUserToken
+ *   5. Writes scripts/.env with STREAM_API_KEY, TEST_USER_ID, TEST_USER_TOKEN, TEST_CHANNEL_ID
  *
  * Usage:
  *   STREAM_API_SECRET=your_secret npx tsx scripts/setup-app.ts
