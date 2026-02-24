@@ -17,57 +17,54 @@ cd openclaw-channel-streamchat
 npm install
 ```
 
-### 2. Generate a bot token
+### 2. Provision the app
 
-The plugin connects to Stream Chat as a regular user (the bot). You need a JWT for that user, generated from your API secret. The secret is only used here — it is **not** stored in the plugin config.
+You have two options depending on your situation:
 
-Create a `.env` file in the plugin root:
+**Option A — Fresh app (recommended for first-time setup)**
 
-```env
-STREAM_API_KEY=your_api_key
-STREAM_API_SECRET=your_api_secret
-BOT_USER_ID=chatgpt
-```
-
-Then run:
+Use `setup-app.ts` if you are starting from a new Stream Chat app. It creates the bot and test users, generates their tokens, creates a test channel, and writes both `~/.openclaw/openclaw.json` and `scripts/.env` automatically:
 
 ```bash
-npx tsx scripts/generate-bot-token.ts
+STREAM_API_KEY=your_api_key STREAM_API_SECRET=your_api_secret npx tsx scripts/setup-app.ts
 ```
 
-This prints the bot JWT. Copy it for the next step.
+After this, skip to step 4.
 
-### 3. Configure OpenClaw
+**Option B — Existing app (bot token only)**
 
-Add the channel config and plugin entry to your `~/.openclaw/openclaw.json`:
+Use `generate-bot-token.ts` if the app and channel already exist and you only need to mint or rotate the bot JWT. It prints the token to stdout — copy it into `~/.openclaw/openclaw.json` manually:
+
+```bash
+STREAM_API_KEY=your_api_key STREAM_API_SECRET=your_api_secret npx tsx scripts/generate-bot-token.ts
+```
+
+> **Note:** Pass the API secret inline as shown above. It is only needed by these two provisioning scripts and should not be stored in `scripts/.env`.
+
+### 3. Configure OpenClaw (Option B only)
+
+If you used Option B, add the channel config and plugin entry to `~/.openclaw/openclaw.json` manually:
 
 ```jsonc
 {
-  // Add the channel configuration
   "channels": {
     "streamchat": {
       "enabled": true,
       "apiKey": "your_api_key",
-      "botUserId": "chatgpt",
-      "botUserToken": "<token from step 2>",
+      "botUserId": "openclaw-bot",
+      "botUserToken": "<token from generate-bot-token.ts>",
       // Optional:
-      "ackReaction": "eyes",           // reaction added when message is received (default: "eyes")
+      "ackReaction": "eyes",              // reaction added when message is received (default: "eyes")
       "doneReaction": "white_check_mark", // reaction swapped in when response is done (default: "white_check_mark")
-      "streamingThrottle": 15          // partial-update every Nth chunk (default: 15)
+      "streamingThrottle": 15             // partial-update every Nth chunk (default: 15)
     }
   },
-
-  // Register the plugin
   "plugins": {
     "load": {
-      "paths": [
-        "/absolute/path/to/openclaw-channel-streamchat"
-      ]
+      "paths": ["/absolute/path/to/openclaw-channel-streamchat"]
     },
     "entries": {
-      "streamchat": {
-        "enabled": true
-      }
+      "streamchat": { "enabled": true }
     }
   }
 }
@@ -83,7 +80,13 @@ The plugin will connect to Stream Chat, watch all channels where the bot is a me
 
 ## Testing
 
-All test scripts live in `scripts/` and can be run with `npx tsx`. They load credentials from `.env` or use environment variables.
+All test scripts live in `scripts/` and load credentials from `scripts/.env` (populated by `setup-app.ts`). The plugin itself reads only from `~/.openclaw/openclaw.json` — `scripts/.env` is not used at runtime.
+
+See `scripts/.env.example` for the expected variables. You can also pass any variable inline to override the file:
+
+```bash
+STREAM_API_KEY=... TEST_USER_TOKEN=... npx tsx scripts/chat-client.ts
+```
 
 ### Discover channels
 
@@ -91,12 +94,6 @@ Lists all channels the test user belongs to:
 
 ```bash
 npx tsx scripts/discover-channels.ts
-```
-
-Override the defaults with environment variables:
-
-```bash
-STREAM_API_KEY=... USER_ID=myuser USER_TOKEN=... npx tsx scripts/discover-channels.ts
 ```
 
 ### Interactive chat client
@@ -121,12 +118,6 @@ Commands inside the interactive client:
 | `/thread <parentId> <text>` | Send a thread reply |
 | `/quote <messageId> <text>` | Send a quoted reply |
 | `/quit` | Disconnect and exit |
-
-Override the test user with environment variables:
-
-```bash
-STREAM_API_KEY=... TEST_USER_ID=myuser TEST_USER_TOKEN=... npx tsx scripts/chat-client.ts
-```
 
 ### Automated round-trip test
 
