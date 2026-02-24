@@ -3,38 +3,23 @@
  * Discover channels that a user belongs to.
  *
  * Usage:
- *   STREAM_API_KEY=... USER_ID=steookk USER_TOKEN=... npx tsx scripts/discover-channels.ts
+ *   npx tsx scripts/discover-channels.ts
+ *
+ * Requires a .env file at the project root (see .env.example).
  */
 
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 
-function loadEnv(): void {
-  try {
-    const envPath = resolve(import.meta.dirname ?? ".", "../.env");
-    const content = readFileSync(envPath, "utf-8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-      if (!process.env[key]) process.env[key] = value;
-    }
-  } catch {
-    // .env file not found
-  }
+const apiKey = process.env.STREAM_API_KEY;
+const userId = process.env.TEST_USER_ID;
+const userToken = process.env.TEST_USER_TOKEN;
+
+if (!apiKey || !userId || !userToken) {
+  console.error("Error: STREAM_API_KEY, TEST_USER_ID, and TEST_USER_TOKEN must be set in .env");
+  process.exit(1);
 }
-
-loadEnv();
-
-const apiKey = process.env.STREAM_API_KEY || "b3haysfrr5yg";
-const userId = process.env.USER_ID || "steookk";
-const userToken =
-  process.env.USER_TOKEN ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoic3Rlb29rayJ9.9yO--MWVC9bYQAjdUR5vp_cKxiBXEzHrXXnPXesqakE";
 
 const client = new StreamChat(apiKey, { allowServerSideConnect: true });
 

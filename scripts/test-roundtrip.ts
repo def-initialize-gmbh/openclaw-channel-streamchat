@@ -1,14 +1,22 @@
 #!/usr/bin/env npx tsx
 /**
  * Automated round-trip test: sends a message and observes the streaming response.
+ *
+ * Requires a .env file at the project root (see .env.example).
  */
 
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
 
-const apiKey = "b3haysfrr5yg";
-const userId = "steookk";
-const userToken =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoic3Rlb29rayJ9.9yO--MWVC9bYQAjdUR5vp_cKxiBXEzHrXXnPXesqakE";
+const apiKey = process.env.STREAM_API_KEY;
+const userId = process.env.TEST_USER_ID;
+const userToken = process.env.TEST_USER_TOKEN;
+
+if (!apiKey || !userId || !userToken) {
+  console.error("Error: STREAM_API_KEY, TEST_USER_ID, and TEST_USER_TOKEN must be set in .env");
+  process.exit(1);
+}
 
 const client = new StreamChat(apiKey, { allowServerSideConnect: true });
 console.log(`Connecting as ${userId}...`);

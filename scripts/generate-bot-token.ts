@@ -12,34 +12,13 @@
  *   channels.streamchat.botUserToken
  */
 
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 
-// Try loading .env manually (no dotenv dependency needed)
-function loadEnv(): void {
-  try {
-    const envPath = resolve(import.meta.dirname ?? ".", "../.env");
-    const content = readFileSync(envPath, "utf-8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-      if (!process.env[key]) process.env[key] = value;
-    }
-  } catch {
-    // .env file not found, that's fine
-  }
-}
-
-loadEnv();
-
-const apiKey = process.env.STREAM_API_KEY || process.env.STREAM_CHAT_API_KEY;
-const apiSecret = process.env.STREAM_API_SECRET || process.env.STREAM_CHAT_API_SECRET;
-const botUserId = process.env.BOT_USER_ID || "chatgpt";
+const apiKey = process.env.STREAM_API_KEY;
+const apiSecret = process.env.STREAM_API_SECRET;
+const botUserId = process.env.BOT_USER_ID || "openclaw-bot";
 
 if (!apiKey || !apiSecret) {
   console.error(

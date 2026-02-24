@@ -14,36 +14,19 @@
  *   npx tsx scripts/test-client.ts myChannel "Hello"  # Send a message and watch
  */
 
+import { config } from "dotenv";
+config({ path: new URL(".env", import.meta.url).pathname });
 import { StreamChat } from "stream-chat";
 import { createInterface } from "node:readline";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 
-function loadEnv(): void {
-  try {
-    const envPath = resolve(import.meta.dirname ?? ".", "../.env");
-    const content = readFileSync(envPath, "utf-8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-      if (!process.env[key]) process.env[key] = value;
-    }
-  } catch {
-    // .env file not found
-  }
+const apiKey = process.env.STREAM_API_KEY;
+const userId = process.env.TEST_USER_ID;
+const userToken = process.env.TEST_USER_TOKEN;
+
+if (!apiKey || !userId || !userToken) {
+  console.error("Error: STREAM_API_KEY, TEST_USER_ID, and TEST_USER_TOKEN must be set in .env");
+  process.exit(1);
 }
-
-loadEnv();
-
-const apiKey = process.env.STREAM_API_KEY || "b3haysfrr5yg";
-const userId = process.env.TEST_USER_ID || "steookk";
-const userToken =
-  process.env.TEST_USER_TOKEN ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoic3Rlb29rayJ9.9yO--MWVC9bYQAjdUR5vp_cKxiBXEzHrXXnPXesqakE";
 
 const channelId = process.argv[2] || "";
 const initialMessage = process.argv[3] || "";
@@ -97,6 +80,7 @@ client.on("message.new", (event) => {
   const aiGenerated = event.message.ai_generated ? " [AI]" : "";
   const generating = (event.message as Record<string, unknown>).generating ? " [generating...]" : "";
   console.log(`\n[${from}]${aiGenerated}${generating}: ${text}`);
+  console.log(`  id: ${event.message.id}`);
 });
 
 // Listen for AI indicators
@@ -112,21 +96,28 @@ for (const evType of ["ai_indicator.update", "ai_indicator.clear"]) {
 }
 
 // Listen for message updates (streaming)
+const lastSeenText = new Map<string, string>();
 client.on("message.updated", (event) => {
   if (!event.message) return;
+  const msgId = event.message.id;
   const text = event.message.text || "";
   const generating = (event.message as Record<string, unknown>).generating;
+  const prev = lastSeenText.get(msgId) ?? "";
+  const delta = text.slice(prev.length);
   if (generating) {
-    process.stdout.write(`\r  [streaming] ${text.slice(-80)}`);
+    lastSeenText.set(msgId, text);
+    if (delta) process.stdout.write(delta);
   } else {
-    console.log(`\n  [final] ${text.slice(0, 200)}`);
+    lastSeenText.delete(msgId);
+    if (delta) process.stdout.write(delta);
+    process.stdout.write(`\n  id: ${msgId}\n`);
   }
 });
 
 // Send initial message if provided
 if (initialMessage) {
-  console.log(`Sending: "${initialMessage}"`);
-  await channel.sendMessage({ text: initialMessage });
+  const { message: sent } = await channel.sendMessage({ text: initialMessage });
+  console.log(`Sent: "${initialMessage}" (id: ${sent.id})`);
 }
 
 // Interactive mode
@@ -176,8 +167,8 @@ rl.on("line", async (line) => {
     return;
   }
 
-  await channel.sendMessage({ text: trimmed });
-  console.log(`  Sent: "${trimmed}"`);
+  const { message: sent } = await channel.sendMessage({ text: trimmed });
+  console.log(`  Sent: "${trimmed}" (id: ${sent.id})`);
 });
 
 // Keep alive
