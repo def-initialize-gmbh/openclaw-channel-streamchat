@@ -1,4 +1,4 @@
-# @wunderchat/openclaw-channel-streamchat
+# openclaw-channel-streamchat
 
 OpenClaw channel plugin for [Stream Chat](https://getstream.io/chat/). Connects as a bot user via WebSocket, normalizes inbound messages into OpenClaw envelope format, and delivers agent responses using Stream Chat's AI streaming pattern (`partialUpdateMessage` + `ai_indicator` events).
 
