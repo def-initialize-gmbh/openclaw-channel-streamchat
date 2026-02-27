@@ -9,6 +9,7 @@ export class StreamChatClientRuntime {
   private account: ResolvedAccount;
   private log?: ChannelLogSink;
   private connected = false;
+  private addedToChannelHandler?: (event: Event) => void;
 
   constructor(account: ResolvedAccount, log?: ChannelLogSink) {
     this.account = account;
@@ -48,7 +49,7 @@ export class StreamChatClientRuntime {
     );
 
     // Auto-watch new channels the bot is added to
-    this.client.on("notification.added_to_channel", (event: Event) => {
+    this.addedToChannelHandler = (event: Event) => {
       if (event.channel) {
         const ch = this.client.channel(
           event.channel.type,
@@ -66,11 +67,16 @@ export class StreamChatClientRuntime {
           );
         });
       }
-    });
+    };
+    this.client.on("notification.added_to_channel", this.addedToChannelHandler);
   }
 
   async stop(): Promise<void> {
     if (this.connected) {
+      if (this.addedToChannelHandler) {
+        this.client.off("notification.added_to_channel", this.addedToChannelHandler);
+        this.addedToChannelHandler = undefined;
+      }
       this.log?.info?.(`[StreamChat] Disconnecting...`);
       await this.client.disconnectUser();
       this.connected = false;

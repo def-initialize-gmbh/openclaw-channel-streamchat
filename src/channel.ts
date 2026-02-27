@@ -27,6 +27,11 @@ import {
 // Track which threads we've already seen (for first-in-thread detection)
 const seenThreads = new Set<string>();
 
+// Module-level registry of active gateway cleanup functions keyed by accountId.
+// Allows startAccount to force-stop a stale connection if the framework calls
+// startAccount again without having called stop() first (e.g. in-process reloads).
+const activeGatewayCleanup = new Map<string, () => void>();
+
 // ---------------------------------------------------------------------------
 // Reactions helper
 // ---------------------------------------------------------------------------
@@ -471,6 +476,16 @@ export const streamchatPlugin: StreamChatChannelPlugin = {
         );
       }
 
+      // Force-stop any stale runtime for this accountId that was never cleaned up
+      // (can happen when the framework does an in-process reload without calling stop()).
+      const staleCleanup = activeGatewayCleanup.get(accountId);
+      if (staleCleanup) {
+        log?.warn?.(
+          `[StreamChat] Stale connection detected for account "${accountId}" — forcing cleanup before restart`,
+        );
+        staleCleanup();
+      }
+
       const chatRuntime = new StreamChatClientRuntime(account, log);
       const runContexts = new RunContextMap();
       const streamingHandler = new StreamingHandler({
@@ -508,15 +523,10 @@ export const streamchatPlugin: StreamChatChannelPlugin = {
         });
       };
 
-      client.on("message.new", handleMessage);
-
       // Listen for force stop from client
-      client.on("ai_indicator.stop" as "user.watching.start", (event: Event) => {
-        // Find the run associated with this message
+      const handleAiStop = (event: Event) => {
         const messageId = (event as unknown as Record<string, unknown>).message_id as string | undefined;
         if (!messageId) return;
-
-        // Look through active streams to find the matching run
         const activeRun = runContexts.findByResponseMessageId(messageId);
         if (activeRun) {
           streamingHandler.onForceStop(activeRun.runId).catch((err) => {
@@ -525,11 +535,19 @@ export const streamchatPlugin: StreamChatChannelPlugin = {
             );
           });
         }
-      });
+      };
 
-      // Handle abort signal
+      client.on("message.new", handleMessage);
+      client.on("ai_indicator.stop" as "user.watching.start", handleAiStop);
+
+      // Handle abort signal / explicit stop — idempotent via `stopped` guard
+      let stopped = false;
       const handleAbort = () => {
+        if (stopped) return;
+        stopped = true;
         client.off("message.new", handleMessage);
+        client.off("ai_indicator.stop" as "user.watching.start", handleAiStop);
+        activeGatewayCleanup.delete(accountId);
         chatRuntime.stop().catch((err) => {
           log?.error?.(
             `[StreamChat] Disconnect error: ${String(err)}`,
@@ -541,6 +559,8 @@ export const streamchatPlugin: StreamChatChannelPlugin = {
           lastStopAt: Date.now(),
         });
       };
+
+      activeGatewayCleanup.set(accountId, handleAbort);
 
       if (abortSignal) {
         abortSignal.addEventListener("abort", handleAbort, { once: true });
