@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto";
-import type { Event } from "stream-chat";
+import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
+import { basename, extname, join } from "node:path";
+import { writeFile, readFile, unlink, stat } from "node:fs/promises";
+import { promisify } from "node:util";
+import { lookup as mimeLookup } from "mime-types";
+import type { Attachment, Channel, Event } from "stream-chat";
 import type {
   ChannelGatewayContext,
   ChannelLogSink,
   ChannelOutboundContext,
   OpenClawConfig,
+  ReplyPayload,
 } from "openclaw/plugin-sdk";
-import { buildChannelConfigSchema } from "openclaw/plugin-sdk";
+import { buildAgentMediaPayload, buildChannelConfigSchema } from "openclaw/plugin-sdk";
 import { StreamChatConfigSchema } from "./config-schema.js";
 import { getStreamChatRuntime } from "./runtime.js";
 import { StreamChatClientRuntime } from "./stream-chat-runtime.js";
@@ -73,6 +80,200 @@ async function removeReaction(
 }
 
 // ---------------------------------------------------------------------------
+// Media helpers
+// ---------------------------------------------------------------------------
+
+const MAX_MEDIA_FILES = 8;
+const DEFAULT_MEDIA_MAX_BYTES = 25 * 1024 * 1024; // 25 MB
+
+/** Attachments that carry downloadable media files. */
+function isMediaAttachment(att: Attachment): boolean {
+  return Boolean(att.asset_url || att.image_url);
+}
+
+/** Resolves the download URL for a Stream Chat attachment. */
+function resolveAttachmentUrl(att: Attachment): string | undefined {
+  return att.asset_url || att.image_url || undefined;
+}
+
+/** Builds a human-readable label for an attachment (used in the envelope). */
+function attachmentLabel(att: Attachment): string {
+  const name = att.title || att.type || "file";
+  return `[Attachment: ${name}]`;
+}
+
+type ResolvedMedia = {
+  path: string;
+  contentType?: string;
+  label: string;
+};
+
+const execFileAsync = promisify(execFile);
+
+/** MIME types that need conversion to OGG before passing to OpenClaw. */
+const WAV_MIMES = new Set(["audio/wav", "audio/wave", "audio/x-wav"]);
+
+/**
+ * Converts a WAV buffer to OGG (Opus) via ffmpeg.
+ * Returns the converted buffer, or the original buffer if ffmpeg is unavailable
+ * or conversion fails.
+ */
+async function convertWavToOgg(
+  buffer: Buffer,
+  log?: ChannelLogSink,
+): Promise<{ buffer: Buffer; contentType: string; ext: string }> {
+  const id = randomUUID();
+  const wavPath = join(tmpdir(), `${id}.wav`);
+  const oggPath = join(tmpdir(), `${id}.ogg`);
+  try {
+    await writeFile(wavPath, buffer);
+    await execFileAsync("ffmpeg", [
+      "-i", wavPath,
+      "-c:a", "libopus",
+      "-y", oggPath,
+    ], { timeout: 15_000 });
+    const oggBuffer = await readFile(oggPath);
+    return { buffer: oggBuffer, contentType: "audio/ogg", ext: ".ogg" };
+  } catch (err) {
+    log?.warn?.(`[StreamChat] WAV→OGG conversion failed, passing WAV as-is: ${String(err)}`);
+    return { buffer, contentType: "audio/wav", ext: ".wav" };
+  } finally {
+    await unlink(wavPath).catch(() => {});
+    await unlink(oggPath).catch(() => {});
+  }
+}
+
+/**
+ * Downloads Stream Chat attachments and saves them locally via the OpenClaw
+ * media pipeline. Returns an array of resolved media entries (empty if none
+ * could be downloaded).
+ */
+async function resolveStreamChatMedia(
+  attachments: Attachment[],
+  maxBytes: number,
+  log?: ChannelLogSink,
+): Promise<ResolvedMedia[]> {
+  const rt = getStreamChatRuntime();
+  const candidates = attachments.filter(isMediaAttachment).slice(0, MAX_MEDIA_FILES);
+  const results: ResolvedMedia[] = [];
+
+  for (const att of candidates) {
+    const url = resolveAttachmentUrl(att);
+    if (!url) continue;
+
+    try {
+      const fetched = await rt.channel.media.fetchRemoteMedia({
+        url,
+        filePathHint: att.title ?? undefined,
+        maxBytes,
+      });
+      if (fetched.buffer.byteLength > maxBytes) continue;
+
+      let mediaBuffer = fetched.buffer;
+      let contentType = att.mime_type ?? fetched.contentType;
+      let fileName = att.title ?? fetched.fileName;
+
+      // Convert WAV to OGG — OpenClaw's mime-to-extension map lacks audio/wav,
+      // so WAV files get saved without an extension and aren't transcribed.
+      if (contentType && WAV_MIMES.has(contentType.split(";")[0]?.trim().toLowerCase())) {
+        const converted = await convertWavToOgg(mediaBuffer, log);
+        mediaBuffer = converted.buffer;
+        contentType = converted.contentType;
+        if (fileName) {
+          fileName = fileName.replace(/\.wav$/i, converted.ext);
+        }
+      }
+
+      if (mediaBuffer.byteLength > maxBytes) continue;
+
+      const saved = await rt.channel.media.saveMediaBuffer(
+        mediaBuffer,
+        contentType,
+        "inbound",
+        maxBytes,
+        fileName,
+      );
+
+      results.push({
+        path: saved.path,
+        contentType: contentType ?? saved.contentType,
+        label: attachmentLabel(att),
+      });
+    } catch (err) {
+      log?.warn?.(
+        `[StreamChat] Failed to download attachment "${att.title ?? url}": ${String(err)}`,
+      );
+    }
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Outbound media helpers
+// ---------------------------------------------------------------------------
+
+const AUDIO_MIMES = new Set([
+  "audio/mpeg", "audio/mp3", "audio/mp4", "audio/ogg", "audio/wav",
+  "audio/wave", "audio/x-wav", "audio/x-m4a", "audio/aac", "audio/flac",
+  "audio/webm",
+]);
+
+function isAudioMime(mime?: string): boolean {
+  if (!mime) return false;
+  return AUDIO_MIMES.has(mime.split(";")[0]?.trim().toLowerCase());
+}
+
+/**
+ * Uploads a local media file to Stream Chat and returns a Stream Chat
+ * attachment object ready to be added to a message.
+ */
+async function uploadOutboundMedia(
+  ch: Channel,
+  localPath: string,
+  audioAsVoice: boolean,
+  log?: ChannelLogSink,
+): Promise<Attachment | null> {
+  try {
+    const fileStat = await stat(localPath);
+    if (!fileStat.isFile()) return null;
+
+    const fileName = basename(localPath);
+    const ext = extname(localPath).toLowerCase();
+    const mimeType = mimeLookup(ext) || "application/octet-stream";
+    const buffer = await readFile(localPath);
+
+    const uploadResp = await ch.sendFile(
+      buffer as unknown as Parameters<typeof ch.sendFile>[0],
+      fileName,
+      mimeType,
+    );
+    const assetUrl = uploadResp.file;
+
+    const isAudio = isAudioMime(mimeType);
+    const attachmentType = isAudio && audioAsVoice ? "voiceRecording" : isAudio ? "audio" : "file";
+
+    const att: Attachment = {
+      type: attachmentType,
+      asset_url: assetUrl,
+      mime_type: mimeType,
+      title: fileName,
+      file_size: fileStat.size,
+    };
+
+    if (attachmentType === "voiceRecording") {
+      att.waveform_data = new Array(100).fill(0.5);
+    }
+
+    log?.info?.(`[StreamChat] Uploaded outbound media: ${fileName} → ${attachmentType}`);
+    return att;
+  } catch (err) {
+    log?.warn?.(`[StreamChat] Failed to upload outbound media "${localPath}": ${String(err)}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Inbound message handler
 // ---------------------------------------------------------------------------
 
@@ -107,8 +308,12 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
   if (event.user?.id === account.botUserId) return;
   if (message.ai_generated) return;
 
-  const text = message.text?.trim();
-  if (!text) return;
+  const text = message.text?.trim() ?? "";
+  const attachments = message.attachments ?? [];
+  const hasMedia = attachments.some(isMediaAttachment);
+
+  // Require either text or downloadable media
+  if (!text && !hasMedia) return;
 
   const channelType = event.channel_type ?? "messaging";
   const channelId = event.channel_id ?? "";
@@ -185,8 +390,17 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
     : false;
   if (threadParentId) seenThreads.add(threadParentId);
 
+  // Download media attachments (if any)
+  const media = hasMedia
+    ? await resolveStreamChatMedia(attachments, DEFAULT_MEDIA_MAX_BYTES, log)
+    : [];
+
+  // For attachment-only messages, synthesize a text body describing the attachments
+  // so the LLM receives something meaningful.
+  const effectiveText = text || media.map((m) => m.label).join("\n");
+
   const envelope = buildEnvelope({
-    text,
+    text: effectiveText,
     senderId,
     senderName,
     messageId,
@@ -195,13 +409,23 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
     isFirstInThread,
   });
 
+  // Build media payload for OpenClaw
+  const mediaPayload = media.length > 0
+    ? buildAgentMediaPayload(
+        media.map((m) => ({
+          path: m.path,
+          contentType: m.contentType ?? null,
+        })),
+      )
+    : {};
+
   // Finalize inbound context
   const to = channelId;
   const fromLabel = `${senderName} (${senderId})`;
 
   const ctx = rt.channel.reply.finalizeInboundContext({
     Body: envelope.body,
-    RawBody: text,
+    RawBody: text || effectiveText,
     CommandBody: envelope.commandBody,
     From: to,
     To: to,
@@ -219,6 +443,7 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
       : Date.now(),
     OriginatingChannel: "streamchat",
     OriginatingTo: to,
+    ...mediaPayload,
   });
 
   // Record session
@@ -240,7 +465,7 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
   });
 
   log?.info?.(
-    `[StreamChat] Inbound: from=${senderName} text="${text.slice(0, 50)}"`,
+    `[StreamChat] Inbound: from=${senderName} text="${effectiveText.slice(0, 50)}"${media.length > 0 ? ` media=${media.length}` : ""}`,
   );
 
   // Send ack reaction
@@ -305,7 +530,7 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
     dispatcherOptions: {
       responsePrefix: "",
       deliver: async (
-        payload: { text?: string; isError?: boolean },
+        payload: ReplyPayload,
         info: { kind: string },
       ) => {
         try {
@@ -323,6 +548,23 @@ async function handleStreamChatMessage(params: HandleMessageParams): Promise<voi
             );
             errorDelivered = true;
             return;
+          }
+
+          // Media attachments: upload to Stream Chat and queue for final message
+          const mediaUrls = [
+            ...(payload.mediaUrl ? [payload.mediaUrl] : []),
+            ...(payload.mediaUrls ?? []),
+          ];
+          for (const mediaPath of mediaUrls) {
+            const att = await uploadOutboundMedia(
+              responseChannel,
+              mediaPath,
+              payload.audioAsVoice ?? false,
+              log,
+            );
+            if (att) {
+              streamingHandler.addAttachment(runId, att);
+            }
           }
 
           // Text blocks are handled token-by-token via onPartialReply above.
@@ -390,7 +632,7 @@ export const streamchatPlugin: StreamChatChannelPlugin = {
     chatTypes: ["channel"],
     reactions: true,
     threads: true,
-    media: false,
+    media: true,
     nativeCommands: false,
     blockStreaming: false,
   },
