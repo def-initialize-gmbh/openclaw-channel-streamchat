@@ -1,4 +1,4 @@
-import type { Channel, StreamChat } from "stream-chat";
+import type { Attachment, Channel, StreamChat } from "stream-chat";
 import type { ChannelLogSink } from "openclaw/plugin-sdk";
 import type { RunContext } from "./types.js";
 import type { RunContextMap } from "./run-context.js";
@@ -57,6 +57,7 @@ interface ActiveStream {
   indicatorState: string | undefined;
   lastUpdatePromise: Promise<void>;
   finalized: boolean;
+  attachments: Attachment[];
 }
 
 export class StreamingHandler {
@@ -115,6 +116,7 @@ export class StreamingHandler {
       indicatorState: "AI_STATE_THINKING",
       lastUpdatePromise: Promise.resolve(),
       finalized: false,
+      attachments: [],
     });
 
     return messageId;
@@ -199,6 +201,16 @@ export class StreamingHandler {
   }
 
   /**
+   * Adds an attachment to the stream's pending list. Attachments are included
+   * in the final partialUpdateMessage when the run completes.
+   */
+  addAttachment(runId: string, attachment: Attachment): void {
+    const stream = this.streams.get(runId);
+    if (!stream || stream.finalized) return;
+    stream.attachments.push(attachment);
+  }
+
+  /**
    * Called when the agent run completes successfully.
    * Finalizes the message text and clears the indicator.
    */
@@ -212,13 +224,17 @@ export class StreamingHandler {
     // Wait for any in-flight partial updates
     await stream.lastUpdatePromise.catch(() => {});
 
-    // Final update with complete text
+    // Final update with complete text and any accumulated attachments
     try {
+      const setFields: Record<string, unknown> = {
+        text: stream.accumulatedText || "(No response)",
+        generating: false,
+      };
+      if (stream.attachments.length > 0) {
+        setFields.attachments = stream.attachments;
+      }
       await client.partialUpdateMessage(stream.messageId, {
-        set: {
-          text: stream.accumulatedText || "(No response)",
-          generating: false,
-        },
+        set: setFields,
       });
     } catch (err) {
       log?.error?.(
